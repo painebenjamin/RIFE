@@ -279,8 +279,8 @@ class RIFEInterpolator(torch.nn.Module):
         b, c, h, w = start.shape
         assert b == 1, "Start and end tensors must have batch size of 1."
 
-        padded_start, padding = self.pad_image(start)
-        padded_end, _ = self.pad_image(end)
+        start, padding = self.pad_image(start)
+        end, _ = self.pad_image(end)
 
         timesteps = torch.linspace(0, 1, num_frames + 2)[1:-1]
         timesteps = timesteps.to(self.device, dtype=self.dtype)
@@ -295,10 +295,10 @@ class RIFEInterpolator(torch.nn.Module):
 
         result_frames: list[torch.Tensor] = []
         if include_start:
-            result_frames.append(padded_start)
+            result_frames.append(start)
         result_frames.extend(middle)
         if include_end:
-            result_frames.append(padded_end)
+            result_frames.append(end)
 
         results = torch.cat(result_frames, dim=0)
         results = self.unpad_image(results, padding)
