@@ -13,7 +13,8 @@ Videos must be in the shape `[b, c, h, w]`, and same range as above.
 
 ```py
 from rife import RIFEInterpolator
-interpolator = RIFEInterpolator(device="cuda")  # or torch.device()
+
+interpolator = RIFEInterpolator.from_pretrained(device="cuda")  # or torch.device()
 
 # Image Examples
 interpolated_1 = interpolator(start, end)  # [c, h, w] if start is 3-dim, else [1, c, h, w]
