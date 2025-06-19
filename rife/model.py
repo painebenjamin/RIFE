@@ -196,6 +196,32 @@ class RIFEInterpolator(torch.nn.Module):
 
         return tuple(prepared_tensors)
 
+    def forward(
+        self,
+        start: torch.Tensor,
+        end: torch.Tensor,
+        num_frames: int = 1,
+    ) -> torch.Tensor:
+        """
+        Runs the frame interpolation network, returning all frames including
+        the start and end frames.
+        """
+        b, c, h, w = start.shape
+        timesteps = torch.linspace(0, 1, num_frames + 2)[1:-1]
+        timesteps = timesteps.to(self.device, dtype=self.dtype)
+
+        middle = [
+            self.module(
+                torch.cat([start, end], dim=1),
+                timestep=t,
+            )
+            for t in timesteps
+        ]
+
+        results = torch.cat(middle, dim=0)
+        return results
+
+    @torch.inference_mode()
     def interpolate_video(
         self,
         video: torch.Tensor,
@@ -208,11 +234,10 @@ class RIFEInterpolator(torch.nn.Module):
         :param video: The video tensor ([B,C,H,W]).
         :param num_frames: The number of frames to interpolate.
         :param loop: Whether to loop the video.
-        :return: A tensor containing the interpolated frames.
+        :return: A tensor containing the interpolated frames ([B,C,H,W], fp32, cpu).
         """
-        if len(video.shape) == 3:
-            video = video.unsqueeze(0)
-
+        video = self.prepare_tensor(video)
+        video, padding = self.pad_image(video)
         b, c, h, w = video.shape
         assert b >= 2, "Video must have at least 2 frames for interpolation."
 
@@ -225,8 +250,8 @@ class RIFEInterpolator(torch.nn.Module):
         num_output_frames = b + num_interpolated_frames
         results = torch.zeros(
             (num_output_frames, 3, h, w),
-            dtype=self.dtype,
-            device=video.device,
+            dtype=torch.float32,
+            device="cpu",
         )
 
         iterator = range(b)
@@ -248,22 +273,26 @@ class RIFEInterpolator(torch.nn.Module):
             results[start_i] = left
 
             interpolated_frames = self.forward(
-                left,
-                right,
+                left[None],
+                right[None],
                 num_frames=num_frames,
-                include_start=True,
-                include_end=True,
             )
-            results[start_i : start_i + num_frames + 2] = interpolated_frames
+            interpolated_frames = interpolated_frames.clamp(0, 1)
+            interpolated_frames = interpolated_frames.float()
+            interpolated_frames = interpolated_frames.detach().cpu()
 
+            results[start_i : start_i + num_frames] = interpolated_frames
+            results[start_i + num_frames] = right
         if loop:
             results = results[:-1]
         else:
             results[-1] = video[-1]
 
+        results = self.unpad_image(results, padding)
         return results
 
-    def forward(
+    @torch.inference_mode()
+    def interpolate(
         self,
         start: torch.Tensor,
         end: torch.Tensor,
@@ -272,34 +301,35 @@ class RIFEInterpolator(torch.nn.Module):
         include_end: bool = False,
     ) -> torch.Tensor:
         """
-        Runs the frame interpolation network, returning all frames including
-        the start and end frames.
+        Interpolate frames between two images.
+        :param start: The starting image tensor ([C,H,W] or [B,C,H,W]).
+        :param end: The ending image tensor ([C,H,W] or [B,C,H,W]).
+        :param num_frames: The number of frames to interpolate between start and end.
+        :param include_start: Whether to include the start frame in the output.
+        :param include_end: Whether to include the end frame in the output.
+        :return: A tensor containing the interpolated frames ([B,C,H,W], fp32, cpu).
         """
         start, end = self.prepare_tensors(start, end)
-        b, c, h, w = start.shape
-        assert b == 1, "Start and end tensors must have batch size of 1."
-
         start, padding = self.pad_image(start)
         end, _ = self.pad_image(end)
 
-        timesteps = torch.linspace(0, 1, num_frames + 2)[1:-1]
-        timesteps = timesteps.to(self.device, dtype=self.dtype)
+        interpolated_frames = self.forward(
+            start,
+            end,
+            num_frames=num_frames,
+        )
 
-        middle = [
-            self.module(
-                torch.cat([start, end], dim=1),
-                timestep=t,
-            )
-            for t in timesteps
-        ]
-
-        result_frames: list[torch.Tensor] = []
+        return_frames = []
         if include_start:
-            result_frames.append(start)
-        result_frames.extend(middle)
+            return_frames.append(start)
+        return_frames.append(interpolated_frames)
         if include_end:
-            result_frames.append(end)
+            return_frames.append(end)
 
-        results = torch.cat(result_frames, dim=0)
-        results = self.unpad_image(results, padding)
-        return results
+        frames = torch.cat(return_frames, dim=0)
+        frames = self.unpad_image(frames, padding)
+        frames = frames.clamp(0, 1)
+        frames = frames.float()
+        frames = frames.detach().cpu()
+
+        return frames
