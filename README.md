@@ -3,7 +3,7 @@
 ## Installation
 
 ```sh
-pip install rife@https://github.com/painebenjamin/RIFE.git
+pip install rife@git+https://github.com/painebenjamin/RIFE.git@main
 ```
 
 ## Usage
