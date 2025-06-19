@@ -1,0 +1,12 @@
+[project]
+name = "rife"
+version = "0.1.0"
+description = "RIFE: Real-Time Intermediate Flow Estimation for Video Frame Interpolation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "huggingface-hub",
+    "numpy",
+    "safetensors",
+    "torch",
+]
