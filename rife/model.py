@@ -124,7 +124,7 @@ class RIFEInterpolator(torch.nn.Module):
         pad_t = pad_h // 2
         pad_r = pad_w - pad_l
         pad_b = pad_h - pad_t
-        padding = (pad_t, pad_b, pad_l, pad_r)
+        padding = (pad_l, pad_r, pad_t, pad_b)
         padded_image = F.pad(image, padding)
 
         if squeeze:
@@ -147,7 +147,7 @@ class RIFEInterpolator(torch.nn.Module):
             squeeze = True
 
         h, w = image.shape[2:]
-        pad_t, pad_b, pad_l, pad_r = padding
+        pad_l, pad_r, pad_t, pad_b = padding
         crop_l = pad_l
         crop_r = w - pad_r
         crop_t = pad_t
