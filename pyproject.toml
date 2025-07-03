@@ -10,3 +10,10 @@ dependencies = [
     "safetensors",
     "torch",
 ]
+
+[project.optional-dependencies]
+scene-detection = [
+    "opencv-python",
+    "scenedetect",
+    "imageio[ffmpeg]",
+]

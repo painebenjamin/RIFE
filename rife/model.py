@@ -1,6 +1,8 @@
 # MIT License
 import os
+import tempfile
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
@@ -222,12 +224,202 @@ class RIFEInterpolator(torch.nn.Module):
         return results
 
     @torch.inference_mode()
+    def interpolate(
+        self,
+        start: torch.Tensor,
+        end: torch.Tensor,
+        num_frames: int = 1,
+        include_start: bool = False,
+        include_end: bool = False,
+    ) -> torch.Tensor:
+        """
+        Interpolate frames between two images.
+        :param start: The starting image tensor ([C,H,W] or [B,C,H,W]).
+        :param end: The ending image tensor ([C,H,W] or [B,C,H,W]).
+        :param num_frames: The number of frames to interpolate between start and end.
+        :param include_start: Whether to include the start frame in the output.
+        :param include_end: Whether to include the end frame in the output.
+        :return: A tensor containing the interpolated frames ([B,C,H,W], fp32, cpu).
+        """
+        start, end = self.prepare_tensors(start, end)
+        start, padding = self.pad_image(start)
+        end, _ = self.pad_image(end)
+
+        interpolated_frames = self.forward(
+            start,
+            end,
+            num_frames=num_frames,
+        )
+
+        return_frames = []
+        if include_start:
+            return_frames.append(start)
+        return_frames.append(interpolated_frames)
+        if include_end:
+            return_frames.append(end)
+
+        frames = torch.cat(return_frames, dim=0)
+        frames = self.unpad_image(frames, padding)
+        frames = frames.clamp(0, 1)
+        frames = frames.float()
+        frames = frames.detach().cpu()
+
+        return frames
+
+    @torch.inference_mode()
     def interpolate_video(
         self,
         video: torch.Tensor,
         num_frames: int = 1,
         loop: bool = False,
         use_tqdm: bool = False,
+        use_scene_detection: bool = False,
+    ) -> torch.Tensor:
+        """
+        Interpolate frames in a video tensor.
+        :param video: The video tensor ([B,C,H,W]).
+        :param num_frames: The number of frames to interpolate.
+        :param loop: Whether to loop the video.
+        :param use_tqdm: Whether to show progress bar.
+        :param use_scene_detection: Whether to use scene detection to preserve hard cuts.
+        :return: A tensor containing the interpolated frames ([B,C,H,W], fp32, cpu).
+        """
+        video = self.prepare_tensor(video)
+        video, padding = self.pad_image(video)
+
+        b, c, h, w = video.shape
+
+        assert b >= 2, "Video must have at least 2 frames for interpolation."
+
+        if use_scene_detection:
+            return self.interpolate_video_with_scene_detection(
+                video, num_frames, loop, use_tqdm, padding
+            )
+        else:
+            return self.interpolate_video_standard(
+                video, num_frames, loop, use_tqdm, padding
+            )
+
+    def detect_scenes(self, video: torch.Tensor) -> list[tuple[int, int]]:
+        """
+        Detect scenes in the video using PySceneDetect.
+        :param video: The video tensor ([B,C,H,W]).
+        :return: list of (start_frame, end_frame) tuples for each scene.
+        """
+        try:
+            import imageio
+            from scenedetect import (  # type: ignore[import-untyped]
+                ContentDetector,
+                detect,
+            )
+        except ImportError as e:
+            raise ImportError(
+                "PySceneDetect and ImageIO are required for scene detection. "
+                "Install them with: pip install rife[scene-detection]"
+            ) from e
+
+        # Convert video tensor to temporary video file for PySceneDetect
+        temp_fd, temp_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(temp_fd)  # Close the file descriptor to avoid locking issues
+        video_np = video.permute(0, 2, 3, 1).cpu().numpy()
+        video_np = (video_np * 255).astype(np.uint8)
+
+        writer = imageio.get_writer(temp_path, fps=16, codec="libx264")
+        for frame in video_np:
+            writer.append_data(frame)
+
+        writer.close()
+
+        if not os.path.exists(temp_path):
+            raise RuntimeError(
+                "Failed to create temporary video file for scene detection."
+            )
+
+        try:
+
+            # Use PySceneDetect to detect scenes
+            scenes = detect(temp_path, ContentDetector(threshold=27.0))
+
+            # Convert to frame indices
+            scene_list = []
+            for start_timecode, end_timecode in scenes:
+                scene_list.append((start_timecode.frame_num, end_timecode.frame_num))
+
+            # If no scenes detected or only one scene, return the entire video as one scene
+            if len(scene_list) <= 1:
+                return [(0, video.shape[0] - 1)]
+
+            return scene_list
+
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    def interpolate_video_with_scene_detection(
+        self,
+        video: torch.Tensor,
+        num_frames: int,
+        loop: bool,
+        use_tqdm: bool,
+        padding: tuple[int, int, int, int],
+    ) -> torch.Tensor:
+        """
+        Interpolate video with scene detection to preserve hard cuts.
+
+        :param video: The video tensor ([B,C,H,W]), fp32, 0 <= video <= 1.
+        :param num_frames: The number of frames to interpolate between each pair of frames.
+        :param loop: Whether to loop the video.
+        :param use_tqdm: Whether to show a progress bar.
+        :param padding: Padding sizes to apply to the video.
+        :return: A tensor containing the interpolated frames ([B,C,H,W], fp32, cpu).
+        """
+        scenes = self.detect_scenes(video)
+
+        # If only one scene, use standard interpolation
+        if len(scenes) == 1:
+            return self.interpolate_video_standard(
+                video, num_frames, loop, use_tqdm, padding
+            )
+
+        # Interpolate each scene separately
+        interpolated_scenes = []
+        total_scenes = len(scenes)
+
+        iterator = iter(scenes)
+        if use_tqdm:
+            from tqdm import tqdm
+
+            iterator = tqdm(  # type: ignore[assignment]
+                iterator, desc="Interpolating scenes", unit="scene", total=total_scenes
+            )
+
+        for i, (start_frame, end_frame) in enumerate(iterator):
+            if i == total_scenes - 1:
+                end_frame += 1  # Include the last frame in the last scene
+
+            # Extract scene
+            scene_video = video[start_frame:end_frame]
+
+            # Interpolate this scene
+            interpolated_scene = self.interpolate_video_standard(
+                scene_video, num_frames, False, use_tqdm, padding
+            )
+
+            interpolated_scenes.append(interpolated_scene)
+
+        # Concatenate all scenes without interpolation between them
+        result = torch.cat(interpolated_scenes, dim=0)
+        result = self.unpad_image(result, padding)
+        return result
+
+    def interpolate_video_standard(
+        self,
+        video: torch.Tensor,
+        num_frames: int,
+        loop: bool,
+        use_tqdm: bool,
+        padding: tuple[int, int, int, int],
     ) -> torch.Tensor:
         """
         Interpolate frames in a video tensor.
@@ -236,10 +428,7 @@ class RIFEInterpolator(torch.nn.Module):
         :param loop: Whether to loop the video.
         :return: A tensor containing the interpolated frames ([B,C,H,W], fp32, cpu).
         """
-        video = self.prepare_tensor(video)
-        video, padding = self.pad_image(video)
         b, c, h, w = video.shape
-        assert b >= 2, "Video must have at least 2 frames for interpolation."
 
         num_interpolated_frames = b * num_frames
         if loop:
@@ -290,46 +479,3 @@ class RIFEInterpolator(torch.nn.Module):
 
         results = self.unpad_image(results, padding)
         return results
-
-    @torch.inference_mode()
-    def interpolate(
-        self,
-        start: torch.Tensor,
-        end: torch.Tensor,
-        num_frames: int = 1,
-        include_start: bool = False,
-        include_end: bool = False,
-    ) -> torch.Tensor:
-        """
-        Interpolate frames between two images.
-        :param start: The starting image tensor ([C,H,W] or [B,C,H,W]).
-        :param end: The ending image tensor ([C,H,W] or [B,C,H,W]).
-        :param num_frames: The number of frames to interpolate between start and end.
-        :param include_start: Whether to include the start frame in the output.
-        :param include_end: Whether to include the end frame in the output.
-        :return: A tensor containing the interpolated frames ([B,C,H,W], fp32, cpu).
-        """
-        start, end = self.prepare_tensors(start, end)
-        start, padding = self.pad_image(start)
-        end, _ = self.pad_image(end)
-
-        interpolated_frames = self.forward(
-            start,
-            end,
-            num_frames=num_frames,
-        )
-
-        return_frames = []
-        if include_start:
-            return_frames.append(start)
-        return_frames.append(interpolated_frames)
-        if include_end:
-            return_frames.append(end)
-
-        frames = torch.cat(return_frames, dim=0)
-        frames = self.unpad_image(frames, padding)
-        frames = frames.clamp(0, 1)
-        frames = frames.float()
-        frames = frames.detach().cpu()
-
-        return frames
