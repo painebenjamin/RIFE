@@ -1,6 +1,7 @@
 # MIT License
 import os
 import tempfile
+from typing import Literal
 
 import numpy as np
 import torch
@@ -190,11 +191,11 @@ class RIFEInterpolator(torch.nn.Module):
         Prepare multiple tensors by ensuring they have the correct shape and type.
         """
         prepared_tensors = [self.prepare_tensor(tensor) for tensor in tensors]
-        first_shape = prepared_tensors[0].shape
+        first_shape = prepared_tensors[0].shape[1:]
 
         assert all(
-            tensor.shape == first_shape for tensor in prepared_tensors
-        ), "All tensors must have the same shape."
+            tensor.shape[1:] == first_shape for tensor in prepared_tensors
+        ), "All tensors must have the same shape except for the batch dimension."
 
         return tuple(prepared_tensors)
 
@@ -299,6 +300,85 @@ class RIFEInterpolator(torch.nn.Module):
             return self.interpolate_video_standard(
                 video, num_frames, loop, use_tqdm, padding
             )
+
+    @torch.inference_mode()
+    def stitch_videos(
+        self,
+        start_video: torch.Tensor,
+        end_video: torch.Tensor,
+        num_overlap_frames: int = 25,
+        mode: Literal["rife_mask", "alpha", "alpha_x_mask"] = "rife_mask",
+        use_confidence: bool = True,
+    ) -> torch.Tensor:
+        """
+        Stitch together a start and end video.
+
+        :param start_video: The start video tensor ([B,C,H,W]).
+        :param end_video: The end video tensor ([B,C,H,W]).
+        :param num_overlap_frames: The number of frames to overlap between the start and end video.
+        :param mode: The mode to use for stitching the video.
+        :param use_confidence: Whether to use confidence for stitching the video.
+        :return: A tensor containing the stitched video ([B,C,H,W], fp32, cpu).
+        """
+        start_video, end_video = self.prepare_tensors(start_video, end_video)
+        start_video, padding = self.pad_image(start_video)
+        end_video, _ = self.pad_image(end_video)
+        num_start_frames, _, height, width = start_video.shape
+        num_end_frames = end_video.shape[0]
+        num_overlap_frames = min(num_start_frames, num_end_frames, num_overlap_frames)
+
+        start_frame = start_video.shape[0] - num_overlap_frames
+        prefix_frames = start_video[:start_frame]
+        suffix_frames = end_video[num_overlap_frames:]
+
+        alpha = torch.linspace(
+            0, 1, num_overlap_frames, device=self.device, dtype=self.dtype
+        ).unsqueeze(0)
+        blended = torch.zeros(
+            (num_overlap_frames, 3, height, width),
+            device=start_video.device,
+            dtype=start_video.dtype,
+        )
+
+        for i in range(num_overlap_frames):
+            img0 = start_video[start_frame + i]
+            img1 = end_video[i]
+            x = torch.cat([img0, img1], dim=0).unsqueeze(0)
+            (
+                warped0,
+                warped1,
+                _,
+                mask_logits,
+                mask,
+                _,
+                extras,
+            ) = self.module.estimate_pair(
+                x, timestep=0.5, return_confidence=use_confidence
+            )
+
+            a = alpha[:, i].view(1, 1, 1, 1)
+            if use_confidence and "confidence" in extras:
+                a = a * extras["confidence"]
+
+            blended[i] = (
+                self.module.compose(
+                    warped0,
+                    warped1,
+                    mask_logits,
+                    mask,
+                    mode=mode,
+                    alpha=a,
+                )
+                .detach()
+                .to(device=start_video.device, dtype=start_video.dtype)
+            )
+
+        blended = torch.cat([prefix_frames, blended, suffix_frames], dim=0)
+
+        blended = self.unpad_image(blended, padding)
+        blended = blended.clamp(0, 1)
+
+        return blended
 
     def detect_scenes(self, video: torch.Tensor) -> list[tuple[int, int]]:
         """
