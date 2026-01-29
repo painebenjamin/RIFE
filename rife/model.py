@@ -301,6 +301,43 @@ class RIFEInterpolator(torch.nn.Module):
                 video, num_frames, loop, use_tqdm, padding
             )
 
+    def label_frame(
+        self,
+        frame: torch.Tensor,
+        frame_index: int,
+        is_suffix: bool = False,
+        prefix_color: tuple[int, int, int] = (255, 0, 0),
+        frame_color: tuple[int, int, int] = (0, 255, 0),
+        suffix_color: tuple[int, int, int] = (0, 0, 255),
+    ) -> torch.Tensor:
+        """
+        Label a frame with the frame index and whether it is a suffix frame.
+        :param frame: The frame tensor ([C,H,W]).
+        :param frame_index: The index of the frame.
+        :param is_suffix: Whether the frame is a suffix frame.
+        :return: The labeled frame tensor ([C,H,W]).
+        """
+        from PIL import Image, ImageDraw, ImageFont
+
+        if frame_index < 0:
+            color = prefix_color
+        elif is_suffix:
+            color = suffix_color
+        else:
+            color = frame_color
+
+        device = frame.device
+        frame = (frame * 255).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        frame = Image.fromarray(frame)
+        draw = ImageDraw.Draw(frame)
+
+        font = ImageFont.load_default(size=48)
+        draw.text((48, 48), f"{frame_index}", fill=color, font=font)
+        frame = np.array(frame)
+        frame = torch.from_numpy(frame).float() / 255.0
+        frame = frame.permute(2, 0, 1).to(device)
+        return frame
+
     @torch.inference_mode()
     def stitch_videos(
         self,
@@ -309,6 +346,8 @@ class RIFEInterpolator(torch.nn.Module):
         num_overlap_frames: int = 25,
         mode: Literal["rife_mask", "alpha", "alpha_x_mask"] = "rife_mask",
         use_confidence: bool = True,
+        alpha_as_timestep: bool = False,
+        include_debug_info: bool = False,
     ) -> torch.Tensor:
         """
         Stitch together a start and end video.
@@ -353,7 +392,9 @@ class RIFEInterpolator(torch.nn.Module):
                 _,
                 extras,
             ) = self.module.estimate_pair(
-                x, timestep=0.5, return_confidence=use_confidence
+                x,
+                timestep=alpha[0, i] if alpha_as_timestep else 0.5,
+                return_confidence=use_confidence,
             )
 
             a = alpha[:, i].view(1, 1, 1, 1)
@@ -372,6 +413,19 @@ class RIFEInterpolator(torch.nn.Module):
                 .detach()
                 .to(device=start_video.device, dtype=start_video.dtype)
             )
+
+        if include_debug_info:
+            num_label_prefix_frames = min(10, prefix_frames.shape[0])
+            num_label_suffix_frames = min(10, suffix_frames.shape[0])
+            num_blended_frames = blended.shape[0]
+            for i in range(1, num_label_prefix_frames + 1):
+                prefix_frames[-i] = self.label_frame(prefix_frames[-i], -i)
+            for i in range(num_blended_frames):
+                blended[i] = self.label_frame(blended[i], i)
+            for i in range(num_label_suffix_frames):
+                suffix_frames[i] = self.label_frame(
+                    suffix_frames[i], num_blended_frames + i, True
+                )
 
         blended = torch.cat([prefix_frames, blended, suffix_frames], dim=0)
 
