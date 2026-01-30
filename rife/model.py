@@ -1,6 +1,7 @@
 # MIT License
 import os
 import tempfile
+from typing import Literal
 
 import numpy as np
 import torch
@@ -190,11 +191,11 @@ class RIFEInterpolator(torch.nn.Module):
         Prepare multiple tensors by ensuring they have the correct shape and type.
         """
         prepared_tensors = [self.prepare_tensor(tensor) for tensor in tensors]
-        first_shape = prepared_tensors[0].shape
+        first_shape = prepared_tensors[0].shape[1:]
 
         assert all(
-            tensor.shape == first_shape for tensor in prepared_tensors
-        ), "All tensors must have the same shape."
+            tensor.shape[1:] == first_shape for tensor in prepared_tensors
+        ), "All tensors must have the same shape except for the batch dimension."
 
         return tuple(prepared_tensors)
 
@@ -299,6 +300,139 @@ class RIFEInterpolator(torch.nn.Module):
             return self.interpolate_video_standard(
                 video, num_frames, loop, use_tqdm, padding
             )
+
+    def label_frame(
+        self,
+        frame: torch.Tensor,
+        frame_index: int,
+        is_suffix: bool = False,
+        prefix_color: tuple[int, int, int] = (255, 0, 0),
+        frame_color: tuple[int, int, int] = (0, 255, 0),
+        suffix_color: tuple[int, int, int] = (0, 0, 255),
+    ) -> torch.Tensor:
+        """
+        Label a frame with the frame index and whether it is a suffix frame.
+        :param frame: The frame tensor ([C,H,W]).
+        :param frame_index: The index of the frame.
+        :param is_suffix: Whether the frame is a suffix frame.
+        :return: The labeled frame tensor ([C,H,W]).
+        """
+        from PIL import Image, ImageDraw, ImageFont
+
+        if frame_index < 0:
+            color = prefix_color
+        elif is_suffix:
+            color = suffix_color
+        else:
+            color = frame_color
+
+        device = frame.device
+        frame = (frame * 255).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        frame = Image.fromarray(frame)
+        draw = ImageDraw.Draw(frame)
+
+        font = ImageFont.load_default(size=48)
+        draw.text((48, 48), f"{frame_index}", fill=color, font=font)
+        frame = np.array(frame)
+        frame = torch.from_numpy(frame).float() / 255.0
+        frame = frame.permute(2, 0, 1).to(device)
+        return frame
+
+    @torch.inference_mode()
+    def stitch_videos(
+        self,
+        start_video: torch.Tensor,
+        end_video: torch.Tensor,
+        num_overlap_frames: int = 25,
+        mode: Literal["rife_mask", "alpha", "alpha_x_mask"] = "rife_mask",
+        use_confidence: bool = True,
+        alpha_as_timestep: bool = False,
+        include_debug_info: bool = False,
+    ) -> torch.Tensor:
+        """
+        Stitch together a start and end video.
+
+        :param start_video: The start video tensor ([B,C,H,W]).
+        :param end_video: The end video tensor ([B,C,H,W]).
+        :param num_overlap_frames: The number of frames to overlap between the start and end video.
+        :param mode: The mode to use for stitching the video.
+        :param use_confidence: Whether to use confidence for stitching the video.
+        :return: A tensor containing the stitched video ([B,C,H,W], fp32, cpu).
+        """
+        start_video, end_video = self.prepare_tensors(start_video, end_video)
+        start_video, padding = self.pad_image(start_video)
+        end_video, _ = self.pad_image(end_video)
+        num_start_frames, _, height, width = start_video.shape
+        num_end_frames = end_video.shape[0]
+        num_overlap_frames = min(num_start_frames, num_end_frames, num_overlap_frames)
+
+        start_frame = start_video.shape[0] - num_overlap_frames
+        prefix_frames = start_video[:start_frame]
+        suffix_frames = end_video[num_overlap_frames:]
+
+        alpha = torch.linspace(
+            0, 1, num_overlap_frames, device=self.device, dtype=self.dtype
+        ).unsqueeze(0)
+        blended = torch.zeros(
+            (num_overlap_frames, 3, height, width),
+            device=start_video.device,
+            dtype=start_video.dtype,
+        )
+
+        for i in range(num_overlap_frames):
+            img0 = start_video[start_frame + i]
+            img1 = end_video[i]
+            x = torch.cat([img0, img1], dim=0).unsqueeze(0)
+            (
+                warped0,
+                warped1,
+                _,
+                mask_logits,
+                mask,
+                _,
+                extras,
+            ) = self.module.estimate_pair(
+                x,
+                timestep=alpha[0, i] if alpha_as_timestep else 0.5,
+                return_confidence=use_confidence,
+            )
+
+            a = alpha[:, i].view(1, 1, 1, 1)
+            if use_confidence and "confidence" in extras:
+                a = a * extras["confidence"]
+
+            blended[i] = (
+                self.module.compose(
+                    warped0,
+                    warped1,
+                    mask_logits,
+                    mask,
+                    mode=mode,
+                    alpha=a,
+                )
+                .detach()
+                .to(device=start_video.device, dtype=start_video.dtype)
+            )
+
+        if include_debug_info:
+            num_label_prefix_frames = min(10, prefix_frames.shape[0])
+            num_label_suffix_frames = min(10, suffix_frames.shape[0])
+            num_blended_frames = blended.shape[0]
+            for i in range(1, num_label_prefix_frames + 1):
+                prefix_frames[-i] = self.label_frame(prefix_frames[-i], -i)
+            for i in range(num_blended_frames):
+                blended[i] = self.label_frame(blended[i], i)
+            for i in range(num_label_suffix_frames):
+                suffix_frames[i] = self.label_frame(
+                    suffix_frames[i], num_blended_frames + i, True
+                )
+
+        blended = torch.cat([prefix_frames, blended, suffix_frames], dim=0)
+
+        blended = self.unpad_image(blended, padding)
+        blended = blended.clamp(0, 1)
+
+        return blended
 
     def detect_scenes(self, video: torch.Tensor) -> list[tuple[int, int]]:
         """
